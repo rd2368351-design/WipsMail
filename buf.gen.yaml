@@ -1,0 +1,16 @@
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/wispmail/wispmail/internal/api/proto
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: internal/api/proto
+    opt: paths=source_relative
+  - remote: buf.build/grpc/go
+    out: internal/api/proto
+    opt: paths=source_relative
+  - remote: buf.build/grpc-ecosystem/gateway
+    out: internal/api/proto
+    opt: paths=source_relative
