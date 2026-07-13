@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  wispmail:
+    image: ghcr.io/wispmail/wispmail:latest
+    container_name: wispmail-server
+    command: serve --config /etc/wispmail/config.prod.yaml
+    ports:
+      - "8080:8080"
+      - "25:25"
+      - "993:993"
+      - "995:995"
+      - "9090:9090"
+    environment:
+      WISPMAIL_ENV: production
+    env_file:
+      - .env.production
+    volumes:
+      - ./config/config.prod.yaml:/etc/wispmail/config.prod.yaml:ro
+      - ./certs:/etc/wispmail/certs:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+
+  wispmail-worker:
+    image: ghcr.io/wispmail/wispmail:latest
+    container_name: wispmail-worker
+    command: /wispmail-worker
+    env_file:
+      - .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      replicas: 3
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: wispmail-postgres
+    environment:
+      POSTGRES_DB: wispmail
+      POSTGRES_USER: wispmail
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: wispmail-redis
+    command: redis-server --appendonly yes --maxmemory 4gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
