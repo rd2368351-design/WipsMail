@@ -1,0 +1,106 @@
+"area:api":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/api/**"
+
+"area:smtp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/smtp/**"
+
+"area:imap":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/imap/**"
+
+"area:storage":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/storage/**"
+          - "database/migrations/**"
+
+"area:auth":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/auth/**"
+
+"area:security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/dkim/**"
+          - "internal/spf/**"
+          - "internal/dmarc/**"
+
+"area:queue":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/queue/**"
+
+"area:mta":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/mta/**"
+
+"area:billing":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/billing/**"
+
+"area:cluster":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/cluster/**"
+          - "internal/coordination/**"
+
+"area:plugin":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "internal/plugin/**"
+
+"type:docs":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "docs/**"
+          - "**/*.md"
+
+"type:ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/dependabot.yml"
+          - ".github/labeler.yml"
+          - ".goreleaser.yml"
+          - "Makefile"
+          - ".golangci.yml"
+          - ".pre-commit-config.yaml"
+          - ".air.toml"
+
+"type:deps":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "go.mod"
+          - "go.sum"
+
+"type:tests":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*_test.go"
+          - "tests/**"
+
+"type:docker":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "Dockerfile*"
+          - "build/Dockerfile*"
+          - "build/docker-compose*.yml"
+          - ".dockerignore"
+
+"type:config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "*.yaml"
+          - "*.yml"
+          - "*.toml"
+          - "*.env*"
+          - ".editorconfig"
+          - ".gitignore"
