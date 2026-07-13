@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Community Discussions
+    url: https://github.com/wispmail/wispmail/discussions
+    about: Ask questions and discuss ideas
+  - name: Documentation
+    url: https://docs.wispmail.com
+    about: Check the documentation
+  - name: Security Report
+    url: https://github.com/wispmail/wispmail/security/advisories/new
+    about: Report security vulnerabilities privately
