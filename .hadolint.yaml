@@ -1,0 +1,6 @@
+failure-threshold: warning
+trustedRegistries: [docker.io, gcr.io, ghcr.io]
+ignored: [DL3018, DL3008]
+override:
+  error: [DL3006]
+  warning: [DL3042]
