@@ -1,0 +1,19 @@
+*                                                         @wispmail/core-team
+
+/.github/                                                 @wispmail/core-team @wispmail/platform-team
+/.github/workflows/                                       @wispmail/core-team @wispmail/platform-team
+
+/internal/auth/                                           @wispmail/core-team @wispmail/security-team
+/internal/dkim/                                           @wispmail/core-team @wispmail/security-team
+/internal/spf/                                            @wispmail/core-team @wispmail/security-team
+/internal/dmarc/                                          @wispmail/core-team @wispmail/security-team
+
+/internal/storage/                                        @wispmail/core-team @wispmail/storage-team
+/database/migrations/                                     @wispmail/core-team @wispmail/storage-team
+
+/docs/                                                    @wispmail/core-team @wispmail/docs-team
+
+/build/                                                   @wispmail/core-team @wispmail/platform-team
+
+/go.mod                                                   @wispmail/core-team
+/go.sum                                                   @wispmail/core-team
