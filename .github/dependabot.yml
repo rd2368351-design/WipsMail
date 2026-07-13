@@ -1,0 +1,98 @@
+version: 2
+
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+    assignees:
+      - "wispmail/core-team"
+    reviewers:
+      - "wispmail/core-team"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      patch-updates:
+        update-types:
+          - "patch"
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "golang.org/*"
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+        update-types:
+          - "minor"
+          - "patch"
+      aws-sdk:
+        patterns:
+          - "github.com/aws/*"
+          - "github.com/aws/aws-sdk-go-v2/*"
+        update-types:
+          - "minor"
+          - "patch"
+      observability:
+        patterns:
+          - "go.opentelemetry.io/*"
+          - "github.com/prometheus/*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    assignees:
+      - "wispmail/platform-team"
+    reviewers:
+      - "wispmail/platform-team"
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "docker"
+    directory: "/build/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "docker"
+    assignees:
+      - "wispmail/platform-team"
+    reviewers:
+      - "wispmail/platform-team"
+    commit-message:
+      prefix: "chore(docker)"
+      include: "scope"
