@@ -1,0 +1,158 @@
+name: CI Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags-ignore:
+      - "v*"
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  security-events: write
+
+env:
+  GO_VERSION: "1.26.5"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: "v1.64.8"
+          args: --timeout=15m --config=.golangci.yml
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: wispmail_test
+          POSTGRES_USER: wispmail
+          POSTGRES_PASSWORD: wispmail_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - env:
+          DATABASE_URL: postgres://wispmail:wispmail_test@localhost:5432/wispmail_test?sslmode=disable
+          REDIS_URL: redis://localhost:6379/0
+          WISPMAIL_ENV: test
+        run: go test -v -race -count=1 -coverprofile=coverage.out -covermode=atomic -shuffle=on ./...
+      - uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          flags: unittests
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: securego/gosec@master
+        with:
+          args: -quiet -fmt=sarif -out=gosec.sarif ./...
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: make build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
+          retention-days: 7
+
+  dependency-review:
+    name: Dependency Review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0
+          vulnerability-check: true
+
+  final-gate:
+    name: CI Passed
+    if: always()
+    needs: [lint, test, security, build, dependency-review]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          for job in lint test security build dependency-review; do
+            result="${{ needs[${job}].result }}"
+            if [ "${result}" != "success" ] && [ "${result}" != "skipped" ]; then
+              echo "FAILED: ${job}"
+              exit 1
+            fi
+          done
+          echo "All required jobs passed."
