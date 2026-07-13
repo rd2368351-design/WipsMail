@@ -1,0 +1,33 @@
+env: test
+log_level: error
+log_format: json
+api:
+  host: "127.0.0.1"
+  port: 0
+  read_timeout: 5s
+  write_timeout: 5s
+  shutdown_timeout: 5s
+smtp:
+  host: "127.0.0.1"
+  port: 0
+database:
+  url: "postgres://wispmail:wispmail_test@localhost:5432/wispmail_test?sslmode=disable"
+redis:
+  url: "redis://localhost:6379/1"
+jwt:
+  secret: "test_secret_key_for_testing_only_do_not_use_in_production"
+  access_ttl: 5m
+  refresh_ttl: 1h
+  issuer: "wispmail-test"
+s3:
+  endpoint: "http://localhost:9000"
+  region: "us-east-1"
+  bucket_name: "wispmail-test"
+  access_key_id: "minioadmin"
+  secret_access_key: "minioadmin"
+  use_ssl: false
+  force_path_style: true
+rate_limit:
+  enabled: false
+cluster:
+  name: "wispmail-test"
