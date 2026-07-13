@@ -1,0 +1,7 @@
+extends: default
+rules:
+  line-length: {max: 140, level: warning}
+  document-start: {present: false}
+  indentation: {spaces: 2, indent-sequences: consistent}
+  truthy: {check-keys: false}
+  empty-lines: {max: 2}
