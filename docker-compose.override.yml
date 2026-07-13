@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  wispmail:
+    build:
+      context: .
+      dockerfile: build/Dockerfile
+    volumes:
+      - .:/app
+      - go_cache:/go/pkg/mod
+    environment:
+      WISPMAIL_ENV: development
+      LOG_LEVEL: debug
+
+volumes:
+  go_cache:
