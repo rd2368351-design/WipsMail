@@ -1,0 +1,52 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: wispmail
+    main: ./cmd/wispmail
+    binary: wispmail
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags: [-s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.buildTime={{.Date}}]
+    env: [CGO_ENABLED=0]
+
+  - id: wispctl
+    main: ./cmd/wispctl
+    binary: wispctl
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags: [-s -w]
+    env: [CGO_ENABLED=0]
+
+  - id: wispmail-worker
+    main: ./cmd/wispmail-worker
+    binary: wispmail-worker
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags: [-s -w]
+    env: [CGO_ENABLED=0]
+
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+    files: [README.md, LICENSE, CHANGELOG.md]
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:", Merge pull request]
+
+dockers:
+  - image_templates:
+      - "ghcr.io/wispmail/wispmail:{{ .Version }}"
+      - "ghcr.io/wispmail/wispmail:latest"
+    dockerfile: build/Dockerfile
+    build_flag_templates:
+      - "--platform=linux/amd64,linux/arm64"
