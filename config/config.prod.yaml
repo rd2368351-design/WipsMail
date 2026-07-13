@@ -1,0 +1,73 @@
+env: production
+log_level: info
+log_format: json
+api:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 60s
+  shutdown_timeout: 60s
+smtp:
+  host: "0.0.0.0"
+  port: 25
+  tls_cert: "/etc/wispmail/certs/fullchain.pem"
+  tls_key: "/etc/wispmail/certs/privkey.pem"
+  max_message_size: 52428800
+imap:
+  host: "0.0.0.0"
+  port: 993
+  tls_cert: "/etc/wispmail/certs/fullchain.pem"
+  tls_key: "/etc/wispmail/certs/privkey.pem"
+pop3:
+  host: "0.0.0.0"
+  port: 995
+  tls_cert: "/etc/wispmail/certs/fullchain.pem"
+  tls_key: "/etc/wispmail/certs/privkey.pem"
+jmap:
+  host: "0.0.0.0"
+  port: 443
+  tls_cert: "/etc/wispmail/certs/fullchain.pem"
+  tls_key: "/etc/wispmail/certs/privkey.pem"
+database:
+  max_open_conns: 50
+  max_idle_conns: 20
+  conn_max_lifetime: 60m
+  conn_max_idle_time: 15m
+redis:
+  pool_size: 100
+  min_idle_conns: 20
+  dial_timeout: 10s
+  read_timeout: 5s
+  write_timeout: 5s
+elasticsearch:
+  index_prefix: "wispmail"
+jwt:
+  access_ttl: 15m
+  refresh_ttl: 7d
+  issuer: "wispmail"
+s3:
+  region: "us-east-1"
+  bucket_name: "wispmail-attachments"
+dkim:
+  selector: "default"
+  private_key_path: "/etc/wispmail/certs/dkim_private.pem"
+otel:
+  service_name: "wispmail"
+  service_version: "1.0.0"
+metrics:
+  path: "/metrics"
+  health_path: "/healthz"
+  ready_path: "/readyz"
+rate_limit:
+  enabled: true
+  requests_per_minute: 100
+  burst: 20
+etcd:
+  dial_timeout: 10s
+cluster:
+  name: "wispmail"
+  bind_addr: "0.0.0.0"
+  bind_port: 7946
+grpc:
+  port: 9090
+  reflection_enabled: false
