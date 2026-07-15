@@ -1,0 +1,994 @@
+package com.mailx.data.remote.utils
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.ConnectivityManager.NetworkCallback
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkInfo
+import android.net.NetworkRequest
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.telephony.TelephonyManager
+import androidx.annotation.RequiresPermission
+import androidx.core.content.getSystemService
+import com.mailx.core.Logger
+import com.mailx.domain.model.NetworkType
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.flowOn
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.Socket
+import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class NetworkStateMonitor @Inject constructor(
+    private val context: Context,
+    private val logger: Logger
+) {
+    
+    private val connectivityManager: ConnectivityManager?
+        get() = context.getSystemService<ConnectivityManager>()
+    
+    private val wifiManager: WifiManager?
+        get() = context.applicationContext.getSystemService()
+    
+    private val telephonyManager: TelephonyManager?
+        get() = context.getSystemService()
+    
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    private val _networkState = MutableStateFlow(NetworkState())
+    val networkState: StateFlow<NetworkState> = _networkState.asStateFlow()
+    
+    private val _isOnline = MutableStateFlow(false)
+    val isOnline: StateFlow<Boolean> = _isOnline.asStateFlow()
+    
+    private val _networkType = MutableStateFlow(NetworkType.UNKNOWN)
+    val networkType: StateFlow<NetworkType> = _networkType.asStateFlow()
+    
+    private val _bandwidthEstimate = MutableStateFlow(BandwidthEstimate.UNKNOWN)
+    val bandwidthEstimate: StateFlow<BandwidthEstimate> = _bandwidthEstimate.asStateFlow()
+    
+    private val _connectionQuality = MutableStateFlow(ConnectionQuality.UNKNOWN)
+    val connectionQuality: StateFlow<ConnectionQuality> = _connectionQuality.asStateFlow()
+    
+    private var networkCallback: ConnectivityNetworkCallback? = null
+    private val isRegistered = AtomicBoolean(false)
+    private val isCaptivePortalCheckRunning = AtomicBoolean(false)
+    private val lastCaptivePortalCheckTime = AtomicLong(0L)
+    
+    private val activeNetworks = ConcurrentHashMap<Long, NetworkInfo>()
+    private val latencyHistory = ArrayDeque<Long>(20)
+    private val bandwidthSamples = ArrayDeque<BandwidthSample>(10)
+    
+    private val wifiBroadcastReceiver = WifiStateReceiver()
+    
+    data class NetworkState(
+        val isConnected: Boolean = false,
+        val networkType: NetworkType = NetworkType.UNKNOWN,
+        val isMetered: Boolean = false,
+        val isCaptivePortal: Boolean = false,
+        val isVpnActive: Boolean = false,
+        val signalStrength: Int = -1,
+        val linkSpeedMbps: Int = 0,
+        val dnsServers: List<String> = emptyList(),
+        val lastChecked: Long = 0L
+    )
+    
+    data class BandwidthEstimate(
+        val downloadKbps: Long = 0L,
+        val uploadKbps: Long = 0L,
+        val latencyMs: Long = 0L,
+        val sampleCount: Int = 0,
+        val confidence: Float = 0f
+    ) {
+        companion object {
+            val UNKNOWN = BandwidthEstimate()
+        }
+    }
+    
+    data class BandwidthSample(
+        val timestamp: Long,
+        val bytesTransferred: Long,
+        val durationMs: Long,
+        val type: SampleType
+    )
+    
+    enum class SampleType {
+        DOWNLOAD, UPLOAD, LATENCY
+    }
+    
+    enum class ConnectionQuality {
+        EXCELLENT, GOOD, FAIR, POOR, UNKNOWN, OFFLINE;
+        
+        val minBandwidthKbps: Long
+            get() = when (this) {
+                EXCELLENT -> 5000
+                GOOD -> 2000
+                FAIR -> 500
+                POOR -> 100
+                UNKNOWN -> 0
+                OFFLINE -> 0
+            }
+        
+        val maxLatencyMs: Long
+            get() = when (this) {
+                EXCELLENT -> 50
+                GOOD -> 150
+                FAIR -> 400
+                POOR -> 1000
+                UNKNOWN -> Long.MAX_VALUE
+                OFFLINE -> Long.MAX_VALUE
+            }
+    }
+    
+    init {
+        registerNetworkCallback()
+        registerWifiReceiver()
+    }
+    
+    fun startMonitoring() {
+        if (isRegistered.compareAndSet(false, true)) {
+            logger.d(TAG, "Network monitoring started")
+            registerNetworkCallback()
+            scope.launch {
+                performInitialCheck()
+                startPeriodicChecks()
+            }
+        }
+    }
+    
+    fun stopMonitoring() {
+        if (isRegistered.compareAndSet(true, false)) {
+            logger.d(TAG, "Network monitoring stopped")
+            unregisterNetworkCallback()
+            unregisterWifiReceiver()
+            scope.cancel()
+        }
+    }
+    
+    fun forceRefresh() {
+        scope.launch {
+            performFullCheck()
+        }
+    }
+    
+    fun getCurrentLatency(): Flow<Long> = callbackFlow {
+        val startTime = System.nanoTime()
+        var latency = -1L
+        
+        try {
+            val socket = Socket()
+            val address = InetSocketAddress("8.8.8.8", 53)
+            
+            withTimeout(3000L) {
+                socket.connect(address, 3000)
+                latency = (System.nanoTime() - startTime) / 1_000_000
+            }
+            
+            socket.close()
+        } catch (_: Exception) {
+            latency = -1L
+        }
+        
+        trySend(latency)
+        awaitClose { }
+    }.flowOn(Dispatchers.IO)
+    
+    fun isNetworkAvailable(): Boolean {
+        val capabilities = connectivityManager?.getNetworkCapabilities(
+            connectivityManager?.activeNetwork
+        ) ?: return false
+        
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+    
+    fun isWifiConnected(): Boolean {
+        val capabilities = connectivityManager?.getNetworkCapabilities(
+            connectivityManager?.activeNetwork
+        ) ?: return false
+        
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    }
+    
+    fun isMobileDataConnected(): Boolean {
+        val capabilities = connectivityManager?.getNetworkCapabilities(
+            connectivityManager?.activeNetwork
+        ) ?: return false
+        
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+    }
+    
+    fun isEthernetConnected(): Boolean {
+        val capabilities = connectivityManager?.getNetworkCapabilities(
+            connectivityManager?.activeNetwork
+        ) ?: return false
+        
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+    
+    fun isVpnActive(): Boolean {
+        val capabilities = connectivityManager?.getNetworkCapabilities(
+            connectivityManager?.activeNetwork
+        ) ?: return false
+        
+        return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+    }
+    
+    fun isMeteredConnection(): Boolean {
+        return connectivityManager?.isActiveNetworkMetered ?: false
+    }
+    
+    fun shouldDeferLargeDownloads(): Boolean {
+        return isMeteredConnection() || 
+               _bandwidthEstimate.value.downloadKbps < ConnectionQuality.FAIR.minBandwidthKbps ||
+               _connectionQuality.value == ConnectionQuality.POOR
+    }
+    
+    fun shouldPauseSync(): Boolean {
+        return !_isOnline.value ||
+               _connectionQuality.value == ConnectionQuality.POOR ||
+               (_bandwidthEstimate.value.downloadKbps < ConnectionQuality.POOR.minBandwidthKbps &&
+                _networkType.value == NetworkType.MOBILE)
+    }
+    
+    fun getNetworkTypeForSync(): NetworkSyncStrategy {
+        return when {
+            !_isOnline.value -> NetworkSyncStrategy.OFFLINE
+            _networkType.value == NetworkType.WIFI -> NetworkSyncStrategy.UNMETERED
+            _connectionQuality.value == ConnectionQuality.EXCELLENT -> NetworkSyncStrategy.AGGRESSIVE
+            _connectionQuality.value == ConnectionQuality.GOOD -> NetworkSyncStrategy.NORMAL
+            _connectionQuality.value == ConnectionQuality.FAIR -> NetworkSyncStrategy.CONSERVATIVE
+            _connectionQuality.value == ConnectionQuality.POOR -> NetworkSyncStrategy.MINIMAL
+            else -> NetworkSyncStrategy.CONSERVATIVE
+        }
+    }
+    
+    enum class NetworkSyncStrategy {
+        AGGRESSIVE, NORMAL, CONSERVATIVE, MINIMAL, UNMETERED, OFFLINE
+    }
+    
+    private suspend fun performInitialCheck() {
+        try {
+            val currentState = buildNetworkState()
+            updateAllStates(currentState)
+            
+            if (currentState.isConnected) {
+                checkCaptivePortal()
+                estimateBandwidth()
+            }
+        } catch (e: Exception) {
+            logger.e(TAG, "Initial network check failed", e)
+            _isOnline.value = false
+            _networkType.value = NetworkType.UNKNOWN
+            _connectionQuality.value = ConnectionQuality.OFFLINE
+        }
+    }
+    
+    private suspend fun startPeriodicChecks() {
+        while (isActive && isRegistered.get()) {
+            try {
+                performFullCheck()
+                delay(30_000L)
+            } catch (e: CancellationException) {
+                break
+            } catch (e: Exception) {
+                logger.w(TAG, "Periodic check failed", e)
+                delay(10_000L)
+            }
+        }
+    }
+    
+    private suspend fun performFullCheck() {
+        val currentState = buildNetworkState()
+        updateAllStates(currentState)
+        
+        if (currentState.isConnected) {
+            val latency = measureLatency()
+            updateLatencyHistory(latency)
+            
+            if (shouldCheckCaptivePortal()) {
+                checkCaptivePortal()
+            }
+            
+            if (shouldEstimateBandwidth()) {
+                estimateBandwidth()
+            }
+            
+            evaluateConnectionQuality()
+        } else {
+            _connectionQuality.value = ConnectionQuality.OFFLINE
+            _bandwidthEstimate.value = BandwidthEstimate.UNKNOWN
+        }
+    }
+    
+    private fun buildNetworkState(): NetworkState {
+        val cm = connectivityManager ?: return NetworkState()
+        val activeNetwork = cm.activeNetwork ?: return NetworkState()
+        val capabilities = cm.getNetworkCapabilities(activeNetwork)
+            ?: return NetworkState()
+        
+        val networkType = determineNetworkType(capabilities)
+        val isMetered = cm.isActiveNetworkMetered
+        val isVpn = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        
+        val signalStrength = when (networkType) {
+            NetworkType.WIFI -> getWifiSignalStrength()
+            NetworkType.MOBILE -> getCellularSignalStrength()
+            else -> -1
+        }
+        
+        val linkSpeed = when (networkType) {
+            NetworkType.WIFI -> capabilities.linkDownstreamBandwidthKbps / 1000
+            else -> capabilities.linkDownstreamBandwidthKbps / 1000
+        }
+        
+        val dnsServers = getDnsServers(activeNetwork)
+        
+        return NetworkState(
+            isConnected = true,
+            networkType = networkType,
+            isMetered = isMetered,
+            isVpnActive = isVpn,
+            signalStrength = signalStrength,
+            linkSpeedMbps = linkSpeed,
+            dnsServers = dnsServers,
+            lastChecked = System.currentTimeMillis()
+        )
+    }
+    
+    private fun determineNetworkType(capabilities: NetworkCapabilities): NetworkType {
+        return when {
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> NetworkType.WIFI
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkType.ETHERNET
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> NetworkType.VPN
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
+                determineCellularType()
+            }
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH) -> NetworkType.BLUETOOTH
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_LOWPAN) -> NetworkType.LOWPAN
+            else -> NetworkType.UNKNOWN
+        }
+    }
+    
+    private fun determineCellularType(): NetworkType {
+        val tm = telephonyManager ?: return NetworkType.MOBILE
+        return try {
+            when (tm.dataNetworkType) {
+                TelephonyManager.NETWORK_TYPE_LTE,
+                TelephonyManager.NETWORK_TYPE_LTE_CA -> NetworkType.MOBILE_4G
+                TelephonyManager.NETWORK_TYPE_NR -> NetworkType.MOBILE_5G
+                TelephonyManager.NETWORK_TYPE_EVDO_0,
+                TelephonyManager.NETWORK_TYPE_EVDO_A,
+                TelephonyManager.NETWORK_TYPE_EVDO_B,
+                TelephonyManager.NETWORK_TYPE_EHRPD,
+                TelephonyManager.NETWORK_TYPE_HSPA,
+                TelephonyManager.NETWORK_TYPE_HSPAP,
+                TelephonyManager.NETWORK_TYPE_HSDPA,
+                TelephonyManager.NETWORK_TYPE_HSUPA -> NetworkType.MOBILE_3G
+                TelephonyManager.NETWORK_TYPE_EDGE,
+                TelephonyManager.NETWORK_TYPE_GPRS -> NetworkType.MOBILE_2G
+                else -> NetworkType.MOBILE
+            }
+        } catch (e: SecurityException) {
+            logger.w(TAG, "Cannot access cellular network type", e)
+            NetworkType.MOBILE
+        }
+    }
+    
+    private fun getWifiSignalStrength(): Int {
+        val wm = wifiManager ?: return -1
+        return try {
+            val info = wm.connectionInfo
+            WifiManager.calculateSignalLevel(info.rssi, 5)
+        } catch (e: SecurityException) {
+            logger.w(TAG, "Cannot access WiFi signal strength", e)
+            -1
+        }
+    }
+    
+    private fun getCellularSignalStrength(): Int {
+        return try {
+            val tm = telephonyManager ?: return -1
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                tm.signalStrength?.level ?: -1
+            } else {
+                @Suppress("DEPRECATION")
+                tm.signalStrength?.level ?: -1
+            }
+        } catch (e: SecurityException) {
+            logger.w(TAG, "Cannot access cellular signal", e)
+            -1
+        }
+    }
+    
+    private fun getDnsServers(network: Network): List<String> {
+        return try {
+            val linkProperties = connectivityManager?.getLinkProperties(network)
+            linkProperties?.dnsServers?.map { it.hostAddress ?: "unknown" } ?: emptyList()
+        } catch (e: Exception) {
+            logger.w(TAG, "Cannot get DNS servers", e)
+            emptyList()
+        }
+    }
+    
+    private suspend fun measureLatency(): Long {
+        val targets = listOf(
+            LatencyTarget("8.8.8.8", 53, "Google DNS"),
+            LatencyTarget("1.1.1.1", 53, "Cloudflare DNS"),
+            LatencyTarget("208.67.222.222", 53, "OpenDNS")
+        )
+        
+        val results = targets.map { target ->
+            async {
+                try {
+                    val socket = Socket()
+                    val address = InetSocketAddress(target.host, target.port)
+                    
+                    val startTime = System.nanoTime()
+                    withTimeout(3000L) {
+                        socket.connect(address, 3000)
+                    }
+                    val latency = (System.nanoTime() - startTime) / 1_000_000
+                    socket.close()
+                    
+                    latency
+                } catch (_: Exception) {
+                    -1L
+                }
+            }
+        }.awaitAll().filter { it > 0 }
+        
+        return if (results.isNotEmpty()) {
+            results.sorted().let { it[it.size / 2] }
+        } else {
+            -1L
+        }
+    }
+    
+    private data class LatencyTarget(
+        val host: String,
+        val port: Int,
+        val description: String
+    )
+    
+    private fun updateLatencyHistory(latencyMs: Long) {
+        if (latencyMs > 0) {
+            synchronized(latencyHistory) {
+                latencyHistory.addLast(latencyMs)
+                if (latencyHistory.size > 20) {
+                    latencyHistory.removeFirst()
+                }
+            }
+        }
+    }
+    
+    private fun getAverageLatency(): Long {
+        synchronized(latencyHistory) {
+            if (latencyHistory.isEmpty()) return -1L
+            val sorted = latencyHistory.sorted()
+            val trimmed = sorted.subList(
+                sorted.size / 4,
+                sorted.size * 3 / 4
+            )
+            return if (trimmed.isNotEmpty()) trimmed.average().toLong() else -1L
+        }
+    }
+    
+    private suspend fun checkCaptivePortal() {
+        if (!isCaptivePortalCheckRunning.compareAndSet(false, true)) {
+            return
+        }
+        
+        try {
+            val result = detectCaptivePortal()
+            _networkState.update { it.copy(isCaptivePortal = result) }
+            
+            if (result) {
+                logger.w(TAG, "Captive portal detected")
+                _isOnline.update { false }
+                _connectionQuality.value = ConnectionQuality.POOR
+            }
+            
+            lastCaptivePortalCheckTime.set(System.currentTimeMillis())
+        } catch (e: Exception) {
+            logger.w(TAG, "Captive portal check failed", e)
+        } finally {
+            isCaptivePortalCheckRunning.set(false)
+        }
+    }
+    
+    private suspend fun detectCaptivePortal(): Boolean {
+        val endpoints = listOf(
+            CaptivePortalEndpoint(
+                url = "http://clients3.google.com/generate_204",
+                expectedStatus = 204,
+                expectedContent = ""
+            ),
+            CaptivePortalEndpoint(
+                url = "http://connectivitycheck.gstatic.com/generate_204",
+                expectedStatus = 204,
+                expectedContent = ""
+            ),
+            CaptivePortalEndpoint(
+                url = "http://www.google.com/blank.html",
+                expectedStatus = 200,
+                expectedContent = null
+            )
+        )
+        
+        for (endpoint in endpoints) {
+            try {
+                val result = withTimeout(5000L) {
+                    checkEndpoint(endpoint)
+                }
+                if (result is CaptivePortalResult.Clear) {
+                    return false
+                }
+            } catch (_: TimeoutCancellationException) {
+                logger.w(TAG, "Captive portal check timeout for ${endpoint.url}")
+            } catch (_: Exception) {
+                logger.w(TAG, "Captive portal check failed for ${endpoint.url}")
+            }
+        }
+        
+        return true
+    }
+    
+    private suspend fun checkEndpoint(
+        endpoint: CaptivePortalEndpoint
+    ): CaptivePortalResult = withContext(Dispatchers.IO) {
+        try {
+            val url = URL(endpoint.url)
+            val connection = url.openConnection() as HttpURLConnection
+            
+            connection.apply {
+                connectTimeout = 5000
+                readTimeout = 5000
+                instanceFollowRedirects = false
+                setRequestProperty("User-Agent", "MailX-ConnectivityCheck/1.0")
+                requestMethod = "GET"
+            }
+            
+            val responseCode = connection.responseCode
+            val responseBody = try {
+                connection.inputStream.bufferedReader().readText()
+            } catch (_: Exception) {
+                null
+            } finally {
+                connection.disconnect()
+            }
+            
+            if (responseCode == endpoint.expectedStatus) {
+                if (endpoint.expectedContent == null || 
+                    responseBody?.contains(endpoint.expectedContent) == true) {
+                    return@withContext CaptivePortalResult.Clear
+                }
+            }
+            
+            if (responseCode in 300..399) {
+                return@withContext CaptivePortalResult.Redirected(
+                    connection.getHeaderField("Location")
+                )
+            }
+            
+            CaptivePortalResult.Captive(
+                responseCode = responseCode,
+                bodyLength = responseBody?.length ?: 0
+            )
+        } catch (e: Exception) {
+            CaptivePortalResult.Error(e.message ?: "Unknown error")
+        }
+    }
+    
+    private data class CaptivePortalEndpoint(
+        val url: String,
+        val expectedStatus: Int,
+        val expectedContent: String?
+    )
+    
+    private sealed class CaptivePortalResult {
+        data object Clear : CaptivePortalResult()
+        data class Redirected(val location: String?) : CaptivePortalResult()
+        data class Captive(val responseCode: Int, val bodyLength: Int) : CaptivePortalResult()
+        data class Error(val message: String) : CaptivePortalResult()
+    }
+    
+    private fun shouldCheckCaptivePortal(): Boolean {
+        val lastCheck = lastCaptivePortalCheckTime.get()
+        val timeSinceLastCheck = System.currentTimeMillis() - lastCheck
+        return timeSinceLastCheck > 120_000L
+    }
+    
+    private suspend fun estimateBandwidth() {
+        try {
+            val sample = withContext(Dispatchers.IO) {
+                performBandwidthSample()
+            }
+            
+            if (sample != null) {
+                synchronized(bandwidthSamples) {
+                    bandwidthSamples.addLast(sample)
+                    if (bandwidthSamples.size > 10) {
+                        bandwidthSamples.removeFirst()
+                    }
+                }
+                
+                val estimate = calculateBandwidthEstimate()
+                _bandwidthEstimate.value = estimate
+                
+                logger.d(
+                    TAG,
+                    "Bandwidth estimated: ${estimate.downloadKbps} kbps down, " +
+                    "${estimate.latencyMs}ms latency"
+                )
+            }
+        } catch (e: Exception) {
+            logger.w(TAG, "Bandwidth estimation failed", e)
+        }
+    }
+    
+    private suspend fun performBandwidthSample(): BandwidthSample? {
+        val testUrls = listOf(
+            "https://www.google.com/images/branding/googlelogo/2x/googlelogo_color_272x92dp.png",
+            "https://www.gstatic.com/webp/gallery/1.webp"
+        )
+        
+        for (url in testUrls) {
+            try {
+                return withTimeout(10000L) {
+                    withContext(Dispatchers.IO) {
+                        val connection = URL(url).openConnection() as HttpURLConnection
+                        connection.apply {
+                            connectTimeout = 5000
+                            readTimeout = 5000
+                            setRequestProperty("User-Agent", "MailX-BandwidthTest/1.0")
+                        }
+                        
+                        val startTime = System.nanoTime()
+                        val bytes = connection.inputStream.readBytes()
+                        val durationNs = System.nanoTime() - startTime
+                        connection.disconnect()
+                        
+                        val durationMs = durationNs / 1_000_000
+                        val bytesTransferred = bytes.size.toLong()
+                        
+                        if (durationMs > 0 && bytesTransferred > 1000) {
+                            BandwidthSample(
+                                timestamp = System.currentTimeMillis(),
+                                bytesTransferred = bytesTransferred,
+                                durationMs = durationMs,
+                                type = SampleType.DOWNLOAD
+                            )
+                        } else {
+                            null
+                        }
+                    }
+                }
+            } catch (_: TimeoutCancellationException) {
+                continue
+            } catch (_: Exception) {
+                continue
+            }
+        }
+        
+        return null
+    }
+    
+    private fun calculateBandwidthEstimate(): BandwidthEstimate {
+        synchronized(bandwidthSamples) {
+            if (bandwidthSamples.isEmpty()) {
+                return BandwidthEstimate.UNKNOWN
+            }
+            
+            val recentSamples = bandwidthSamples.takeLast(5)
+            val totalBytes = recentSamples.sumOf { it.bytesTransferred }
+            val totalDurationMs = recentSamples.sumOf { it.durationMs }
+            
+            val downloadKbps = if (totalDurationMs > 0) {
+                (totalBytes * 8L * 1000L) / totalDurationMs / 1000L
+            } else {
+                0L
+            }
+            
+            val avgLatency = getAverageLatency()
+            val confidence = calculateConfidence(recentSamples.size)
+            
+            return BandwidthEstimate(
+                downloadKbps = downloadKbps,
+                uploadKbps = downloadKbps / 2,
+                latencyMs = avgLatency,
+                sampleCount = recentSamples.size,
+                confidence = confidence
+            )
+        }
+    }
+    
+    private fun calculateConfidence(sampleCount: Int): Float {
+        return when {
+            sampleCount >= 5 -> 0.9f
+            sampleCount >= 3 -> 0.6f
+            sampleCount >= 1 -> 0.3f
+            else -> 0f
+        }
+    }
+    
+    private fun shouldEstimateBandwidth(): Boolean {
+        synchronized(bandwidthSamples) {
+            if (bandwidthSamples.isEmpty()) return true
+            val lastSample = bandwidthSamples.last()
+            return System.currentTimeMillis() - lastSample.timestamp > 300_000L
+        }
+    }
+    
+    private fun evaluateConnectionQuality() {
+        val bandwidth = _bandwidthEstimate.value
+        val latency = getAverageLatency()
+        
+        val quality = when {
+            !_isOnline.value -> ConnectionQuality.OFFLINE
+            bandwidth.downloadKbps >= ConnectionQuality.EXCELLENT.minBandwidthKbps &&
+            latency in 1..ConnectionQuality.EXCELLENT.maxLatencyMs -> ConnectionQuality.EXCELLENT
+            bandwidth.downloadKbps >= ConnectionQuality.GOOD.minBandwidthKbps &&
+            latency in 1..ConnectionQuality.GOOD.maxLatencyMs -> ConnectionQuality.GOOD
+            bandwidth.downloadKbps >= ConnectionQuality.FAIR.minBandwidthKbps &&
+            latency in 1..ConnectionQuality.FAIR.maxLatencyMs -> ConnectionQuality.FAIR
+            bandwidth.downloadKbps >= ConnectionQuality.POOR.minBandwidthKbps -> ConnectionQuality.POOR
+            _isOnline.value -> ConnectionQuality.UNKNOWN
+            else -> ConnectionQuality.OFFLINE
+        }
+        
+        _connectionQuality.value = quality
+        
+        logger.d(
+            TAG,
+            "Connection quality: $quality (${bandwidth.downloadKbps}kbps, ${latency}ms)"
+        )
+    }
+    
+    private fun updateAllStates(state: NetworkState) {
+        _networkState.value = state
+        _isOnline.value = state.isConnected && !state.isCaptivePortal
+        _networkType.value = state.networkType
+    }
+    
+    private fun registerNetworkCallback() {
+        try {
+            unregisterNetworkCallback()
+            
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+                .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                .build()
+            
+            networkCallback = ConnectivityNetworkCallback()
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                connectivityManager?.registerDefaultNetworkCallback(
+                    networkCallback!!,
+                    mainHandler
+                )
+            } else {
+                connectivityManager?.registerNetworkCallback(
+                    request,
+                    networkCallback!!
+                )
+            }
+            
+            logger.d(TAG, "Network callback registered")
+        } catch (e: SecurityException) {
+            logger.e(TAG, "Permission denied registering network callback", e)
+        } catch (e: Exception) {
+            logger.e(TAG, "Failed to register network callback", e)
+        }
+    }
+    
+    private fun unregisterNetworkCallback() {
+        try {
+            networkCallback?.let { callback ->
+                connectivityManager?.unregisterNetworkCallback(callback)
+                logger.d(TAG, "Network callback unregistered")
+            }
+            networkCallback = null
+        } catch (e: IllegalArgumentException) {
+            logger.w(TAG, "Network callback already unregistered")
+        } catch (e: Exception) {
+            logger.e(TAG, "Failed to unregister network callback", e)
+        }
+    }
+    
+    private fun registerWifiReceiver() {
+        try {
+            val filter = IntentFilter().apply {
+                addAction(WifiManager.WIFI_STATE_CHANGED_ACTION)
+                addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION)
+                addAction(WifiManager.RSSI_CHANGED_ACTION)
+            }
+            
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(
+                    wifiBroadcastReceiver,
+                    filter,
+                    Context.RECEIVER_NOT_EXPORTED
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.registerReceiver(wifiBroadcastReceiver, filter)
+            }
+            
+            logger.d(TAG, "WiFi receiver registered")
+        } catch (e: Exception) {
+            logger.e(TAG, "Failed to register WiFi receiver", e)
+        }
+    }
+    
+    private fun unregisterWifiReceiver() {
+        try {
+            context.unregisterReceiver(wifiBroadcastReceiver)
+            logger.d(TAG, "WiFi receiver unregistered")
+        } catch (e: IllegalArgumentException) {
+            logger.w(TAG, "WiFi receiver already unregistered")
+        } catch (e: Exception) {
+            logger.e(TAG, "Failed to unregister WiFi receiver", e)
+        }
+    }
+    
+    private inner class ConnectivityNetworkCallback : NetworkCallback() {
+        
+        override fun onAvailable(network: Network) {
+            logger.d(TAG, "Network available: ${network.networkHandle}")
+            mainHandler.post {
+                scope.launch {
+                    val state = buildNetworkState()
+                    updateAllStates(state)
+                    checkCaptivePortal()
+                    estimateBandwidth()
+                    evaluateConnectionQuality()
+                }
+            }
+        }
+        
+        override fun onLost(network: Network) {
+            logger.w(TAG, "Network lost: ${network.networkHandle}")
+            mainHandler.post {
+                _networkState.value = NetworkState()
+                _isOnline.value = false
+                _networkType.value = NetworkType.UNKNOWN
+                _connectionQuality.value = ConnectionQuality.OFFLINE
+                _bandwidthEstimate.value = BandwidthEstimate.UNKNOWN
+            }
+        }
+        
+        override fun onCapabilitiesChanged(
+            network: Network,
+            capabilities: NetworkCapabilities
+        ) {
+            logger.d(TAG, "Network capabilities changed: ${network.networkHandle}")
+            mainHandler.post {
+                scope.launch {
+                    val state = buildNetworkState()
+                    updateAllStates(state)
+                    evaluateConnectionQuality()
+                }
+            }
+        }
+        
+        override fun onLinkPropertiesChanged(
+            network: Network,
+            linkProperties: LinkProperties
+        ) {
+            logger.d(TAG, "Link properties changed: ${network.networkHandle}")
+            mainHandler.post {
+                scope.launch {
+                    val state = buildNetworkState()
+                    updateAllStates(state)
+                }
+            }
+        }
+        
+        override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+            logger.w(TAG, "Network blocked status: $blocked for ${network.networkHandle}")
+            if (blocked) {
+                mainHandler.post {
+                    _isOnline.value = false
+                    _connectionQuality.value = ConnectionQuality.POOR
+                }
+            }
+        }
+    }
+    
+    private inner class WifiStateReceiver : BroadcastReceiver() {
+        
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent == null) return
+            
+            when (intent.action) {
+                WifiManager.WIFI_STATE_CHANGED_ACTION -> {
+                    val wifiState = intent.getIntExtra(
+                        WifiManager.EXTRA_WIFI_STATE,
+                        WifiManager.WIFI_STATE_UNKNOWN
+                    )
+                    logger.d(TAG, "WiFi state changed: $wifiState")
+                    
+                    if (wifiState == WifiManager.WIFI_STATE_ENABLED ||
+                        wifiState == WifiManager.WIFI_STATE_DISABLED) {
+                        scope.launch {
+                            delay(2000)
+                            val state = buildNetworkState()
+                            updateAllStates(state)
+                        }
+                    }
+                }
+                
+                WifiManager.NETWORK_STATE_CHANGED_ACTION -> {
+                    @Suppress("DEPRECATION")
+                    val networkInfo = intent.getParcelableExtra<NetworkInfo>(
+                        WifiManager.EXTRA_NETWORK_INFO
+                    )
+                    
+                    networkInfo?.let { info ->
+                        logger.d(TAG, "WiFi network state: ${info.state}")
+                        scope.launch {
+                            delay(1000)
+                            val state = buildNetworkState()
+                            updateAllStates(state)
+                            evaluateConnectionQuality()
+                        }
+                    }
+                }
+                
+                WifiManager.RSSI_CHANGED_ACTION -> {
+                    val rssi = intent.getIntExtra(WifiManager.EXTRA_NEW_RSSI, -100)
+                    logger.d(TAG, "WiFi RSSI changed: $rssi dBm")
+                    
+                    scope.launch {
+                        val state = buildNetworkState()
+                        _networkState.update { it.copy(signalStrength = state.signalStrength) }
+                    }
+                }
+            }
+        }
+    }
+    
+    fun shutdown() {
+        logger.i(TAG, "Shutting down NetworkStateMonitor")
+        stopMonitoring()
+        
+        synchronized(latencyHistory) { latencyHistory.clear() }
+        synchronized(bandwidthSamples) { bandwidthSamples.clear() }
+        activeNetworks.clear()
+        
+        logger.i(TAG, "NetworkStateMonitor shutdown complete")
+    }
+    
+    companion object {
+        private const val TAG = "NetworkStateMonitor"
+    }
+}
